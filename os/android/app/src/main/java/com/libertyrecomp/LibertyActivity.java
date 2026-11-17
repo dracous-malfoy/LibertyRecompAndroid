@@ -12,6 +12,11 @@ import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
 
+import android.app.AlertDialog;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.widget.Button;
+import android.widget.RelativeLayout;
 import org.libsdl.app.SDLActivity;
 import org.libsdl.app.SDLSurface;
 
@@ -85,11 +90,13 @@ public class LibertyActivity extends SDLActivity {
     static final String EXTRA_OTHER_REFLECTION_INTERVAL = "perf_other_reflection_interval";
     private boolean mDebugLog;
     private File mDebugLogFile;
+    private AlertDialog mGameMenu;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         prepareEnvironment();
         super.onCreate(savedInstanceState);
+        if (!mBrokenLibraries && mLayout != null) addGameMenuButton();
         // A controller-driven game sends no touch events for minutes at a time.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // Steady clocks the device can hold, instead of peaks followed by
@@ -104,6 +111,65 @@ public class LibertyActivity extends SDLActivity {
         }
     }
 
+    private void addGameMenuButton() {
+        float d = getResources().getDisplayMetrics().density;
+        Button menuBtn = new Button(this);
+        menuBtn.setText("☰");
+        menuBtn.setTextColor(Color.WHITE);
+        menuBtn.setTextSize(16);
+        menuBtn.setPadding(0, 0, 0, 0);
+        menuBtn.setFocusable(false);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(0x90202020);
+        menuBtn.setBackground(bg);
+        RelativeLayout.LayoutParams params =
+                new RelativeLayout.LayoutParams((int) (38 * d), (int) (38 * d));
+        params.addRule(RelativeLayout.ALIGN_PARENT_RIGHT);
+        params.addRule(RelativeLayout.ALIGN_PARENT_TOP);
+        params.setMargins(0, (int) (10 * d), (int) (10 * d), 0);
+        menuBtn.setOnClickListener(v -> showGameMenu());
+        mLayout.addView(menuBtn, params);
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void onBackPressed() {
+        if (mBrokenLibraries) { super.onBackPressed(); return; }
+        if (mGameMenu != null && mGameMenu.isShowing()) mGameMenu.dismiss();
+        else showGameMenu();
+    }
+
+    private void showGameMenu() {
+        if (mGameMenu != null && mGameMenu.isShowing()) return;
+        String[] items = {"Resume", "Edit Xbox controls", "Quit to launcher"};
+        mGameMenu = new AlertDialog.Builder(this)
+                .setTitle("Game Menu")
+                .setItems(items, (dialog, which) -> {
+                    if (which == 1) startActivity(new Intent(this, TouchEditorActivity.class));
+                    else if (which == 2) confirmQuit();
+                })
+                .setOnDismissListener(d -> hideSystemBars())
+                .create();
+        mGameMenu.show();
+    }
+
+    private void confirmQuit() {
+        new AlertDialog.Builder(this)
+                .setTitle("Quit to launcher?")
+                .setMessage("Unsaved game progress will be lost.")
+                .setNegativeButton("Cancel", (d, w) -> showGameMenu())
+                .setPositiveButton("Quit", (d, w) -> {
+                    Intent launcher = new Intent(this, LauncherActivity.class);
+                    launcher.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(launcher);
+                    finish();
+                    new android.os.Handler(android.os.Looper.getMainLooper())
+                            .postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 500);
+                })
+                .show();
+    }
+    
     /**
      * Picks the Vulkan driver before SDL loads libmain.so; see DriverBridge.
      * When no driver can run the game, the error thrown here is shown by
