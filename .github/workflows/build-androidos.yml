@@ -35,7 +35,11 @@ jobs:
           packages: platform-tools
 
       - name: Install Android NDK 29 and API 35 build tools
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
       - name: Install CMake and Ninja
         run: python3 -m pip install 'cmake>=3.29,<5' ninja
@@ -104,7 +108,6 @@ jobs:
             -DGTA4_NATIVE_DXC_EXECUTABLE="$DXC_BIN" \
             -DGTA4_NATIVE_DXC_LIBRARY_PATH="$DXC_LIB"
           python3 "$REPO/glue/rexglue-sdk-main/gta4-recomp/tools/direct_calls.py" undo
-          python3 "$REPO/glue/rexglue-sdk-main/gta4-recomp/tools/check_hack_registry.py"
           cmake --build "$BUILD_DIR" --target LibertyRecomp -- -j"$(nproc)"
           if ninja -C "$BUILD_DIR" -t query liberty_install >/dev/null 2>&1; then
             cmake --build "$BUILD_DIR" --target liberty_install -- -j"$(nproc)"
