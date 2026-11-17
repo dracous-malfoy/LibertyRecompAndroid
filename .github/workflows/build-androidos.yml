@@ -43,7 +43,6 @@ jobs:
       - name: Initialize dependencies and apply patches
         run: |
           python3 tools/setup_repo.py
-          python3 os/android/scripts/materialize_symlinks.py
 
       - name: Download Linux DXC and glslang host tools
         env:
