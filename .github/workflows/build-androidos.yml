@@ -1,0 +1,140 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android NDK 29 and API 35 build tools
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+
+      - name: Install CMake and Ninja
+        run: python3 -m pip install 'cmake>=3.29,<5' ninja
+
+      - name: Initialize dependencies and apply patches
+        run: |
+          python3 tools/setup_repo.py
+          python3 os/android/scripts/materialize_symlinks.py
+
+      - name: Download Linux DXC and glslang host tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out/host-tools/dxc out/host-tools/glslang
+          python3 - <<'PY'
+          import json, os, urllib.request
+          req = urllib.request.Request(
+              'https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/tags/v1.9.2609',
+              headers={'Authorization': f"Bearer {os.environ['GH_TOKEN']}", 'Accept': 'application/vnd.github+json'}
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              data = json.load(r)
+          urls = [a['browser_download_url'] for a in data['assets'] if 'linux' in a['name'].lower() and a['name'].endswith('.tar.gz')]
+          assert urls, 'No Linux DXC tarball found'
+          urllib.request.urlretrieve(urls[0], 'out/host-tools/dxc.tar.gz')
+          PY
+          tar -xzf out/host-tools/dxc.tar.gz -C out/host-tools/dxc
+          curl -fsSL -o out/host-tools/glslang.tar.gz https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz
+          tar -xzf out/host-tools/glslang.tar.gz -C out/host-tools/glslang
+          DXC_BIN="$(find "$PWD/out/host-tools/dxc" -name 'dxc' -type f | head -1)"
+          DXC_LIB="$(dirname "$(find "$PWD/out/host-tools/dxc" -name 'libdxcompiler.so*' | head -1)")"
+          GLSLANG_BIN="$(find "$PWD/out/host-tools/glslang" -name 'glslangValidator' \( -type f -o -type l \) | head -1)"
+          if [ -z "$GLSLANG_BIN" ]; then
+            G="$(find "$PWD/out/host-tools/glslang" -name 'glslang' -type f | head -1)"
+            cp "$G" "$(dirname "$G")/glslangValidator"
+            GLSLANG_BIN="$(dirname "$G")/glslangValidator"
+          fi
+          chmod +x "$DXC_BIN" "$GLSLANG_BIN"
+          echo "DXC_BIN=$DXC_BIN" >> "$GITHUB_ENV"
+          echo "DXC_LIB=$DXC_LIB" >> "$GITHUB_ENV"
+          echo "GLSLANG_BIN=$GLSLANG_BIN" >> "$GITHUB_ENV"
+
+      - name: Build driver proxy
+        run: bash os/android/scripts/build_driver_proxy.sh
+
+      - name: Build and stage native engine (Snapdragon 870)
+        run: |
+          set -euo pipefail
+          export BUILD_TYPE=Release
+          . os/android/scripts/env.sh
+          CPU_FLAGS="-mcpu=cortex-a77 -fno-emulated-tls"
+          cmake -S "$REPO" -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_C_FLAGS="$CPU_FLAGS" \
+            -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
+            -DCMAKE_TOOLCHAIN_FILE="$REPO/toolchains/android.cmake" \
+            -DANDROID_NDK="$ANDROID_NDK" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DLIBERTY_RECOMP_TARGET_PLATFORM=android \
+            -DLIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS=ON \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DREXGLUE_ENABLE_TRACY=OFF \
+            -DGTA4_NATIVE_SPIRV_VAL="$ANDROID_NDK/shader-tools/linux-x86_64/spirv-val" \
+            -DGTA4_NATIVE_GLSLANG_VALIDATOR="$GLSLANG_BIN" \
+            -DGTA4_NATIVE_DXC_EXECUTABLE="$DXC_BIN" \
+            -DGTA4_NATIVE_DXC_LIBRARY_PATH="$DXC_LIB"
+          python3 "$REPO/glue/rexglue-sdk-main/gta4-recomp/tools/direct_calls.py" undo
+          python3 "$REPO/glue/rexglue-sdk-main/gta4-recomp/tools/check_hack_registry.py"
+          cmake --build "$BUILD_DIR" --target LibertyRecomp -- -j"$(nproc)"
+          if ninja -C "$BUILD_DIR" -t query liberty_install >/dev/null 2>&1; then
+            cmake --build "$BUILD_DIR" --target liberty_install -- -j"$(nproc)"
+          fi
+          mkdir -p "$JNILIBS"
+          rm -f "$JNILIBS"/libmain.so "$JNILIBS"/libliberty_install.so "$JNILIBS"/librexruntime.so "$JNILIBS"/librexgpu-*.so "$JNILIBS"/libSDL3.so "$JNILIBS"/libc++_shared.so
+          for so in "$BUILD_DIR"/glue/gta4-recomp/libmain.so \
+                    "$BUILD_DIR"/glue/gta4-recomp/libliberty_install.so "$REX_OUT_DIR"/librexruntime.so \
+                    "$REX_OUT_DIR"/librexgpu-*.so "$REX_OUT_DIR"/libSDL3.so; do
+            [ -f "$so" ] || continue
+            "$NDK_BIN/llvm-strip" --strip-unneeded -o "$JNILIBS/$(basename "$so")" "$so"
+          done
+          cp "$NDK_SYSROOT_LIB/libc++_shared.so" "$JNILIBS/"
+          RES="$ASSETS/Resources"
+          rm -rf "$RES"
+          mkdir -p "$RES/button_prompts"
+          [ -d "$REPO/LibertyRecompLib/font_atlases" ] && cp -r "$REPO/LibertyRecompLib/font_atlases" "$RES/"
+          [ -d "$REPO/LibertyRecompLib/private/button_prompts" ] && cp -r "$REPO/LibertyRecompLib/private/button_prompts/." "$RES/button_prompts/"
+          [ -f "$REPO/LibertyRecompLib/aes_key.bin" ] && cp "$REPO/LibertyRecompLib/aes_key.bin" "$RES/"
+          ls -la "$JNILIBS"
+
+      - name: Package APK
+        run: |
+          chmod +x os/android/gradlew
+          bash os/android/scripts/build_apk.sh debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibertyRecomp-SD870-APK
+          path: os/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
